@@ -51,6 +51,7 @@ except Exception as e:
     # Re-raise so the stack trace is visible after our explanatory message.
     raise
 import imutils
+import csv
 
 import config
 
@@ -91,6 +92,29 @@ def create_db_if_needed(db_path: str = config.DB_PATH):
             )
             """
         )
+        # daily_totals stores aggregated seconds per day (redundant but fast to query)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_totals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                date DATE,
+                total_seconds REAL,
+                UNIQUE(name, date)
+            )
+            """
+        )
+        # current_state stores persistent per-user accumulated seconds and last update
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS current_state (
+                name TEXT PRIMARY KEY,
+                camera_id TEXT,
+                accumulated_seconds REAL,
+                last_update DATETIME
+            )
+            """
+        )
     conn.commit()
     conn.close()
 
@@ -117,6 +141,20 @@ def log_session(name: str, start_time: datetime, end_time: datetime, duration_se
         "INSERT INTO sessions (name, start_time, end_time, duration_seconds, camera_id) VALUES (?, ?, ?, ?, ?)",
         (name, start_time.strftime('%Y-%m-%d %H:%M:%S'), end_time.strftime('%Y-%m-%d %H:%M:%S'), float(duration_seconds), camera_id),
     )
+    # also update daily_totals for the session's date (based on start_time)
+    try:
+        the_date = start_time.date().isoformat()
+        # try to update existing row
+        c.execute("SELECT total_seconds FROM daily_totals WHERE name=? AND date=?", (name, the_date))
+        row = c.fetchone()
+        if row is None:
+            c.execute("INSERT INTO daily_totals (name, date, total_seconds) VALUES (?, ?, ?)", (name, the_date, float(duration_seconds)))
+        else:
+            new_total = float(row[0]) + float(duration_seconds)
+            c.execute("UPDATE daily_totals SET total_seconds=? WHERE name=? AND date=?", (new_total, name, the_date))
+    except Exception:
+        # if daily_totals table doesn't exist or fails, ignore
+        pass
     conn.commit()
     conn.close()
 
@@ -316,6 +354,74 @@ def init_presence(known_embeddings: dict):
     return presence
 
 
+def load_today_totals(db_path: str = config.DB_PATH):
+    """Return a dict of {name: total_seconds} for today's date based on sessions/daily_totals."""
+    totals = {}
+    today = datetime.now().date().isoformat()
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        # Prefer daily_totals if available
+        c.execute("SELECT name, total_seconds FROM daily_totals WHERE date=?", (today,))
+        rows = c.fetchall()
+        if rows:
+            for r in rows:
+                totals[r[0]] = float(r[1])
+            conn.close()
+            return totals
+
+        # fallback: sum sessions that started today
+        c.execute("SELECT name, SUM(duration_seconds) FROM sessions WHERE date(start_time)=? GROUP BY name", (today,))
+        rows = c.fetchall()
+        for r in rows:
+            totals[r[0]] = float(r[1]) if r[1] is not None else 0.0
+        conn.close()
+    except Exception:
+        pass
+    return totals
+
+
+def load_current_state(db_path: str = config.DB_PATH):
+    """Load persistent current state (accumulated seconds) for users.
+
+    Returns dict name -> accumulated_seconds
+    """
+    state = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT name, accumulated_seconds FROM current_state")
+        rows = c.fetchall()
+        for r in rows:
+            state[r[0]] = float(r[1]) if r[1] is not None else 0.0
+        conn.close()
+    except Exception:
+        pass
+    return state
+
+
+def save_current_state(presence: dict, camera_id: str, db_path: str = config.DB_PATH):
+    """Persist current per-user accumulated time into current_state table.
+
+    This is called on clean shutdown to ensure accumulated times survive restarts.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        now = datetime.now()
+        for name, info in presence.items():
+            acc = float(info.get('accumulated', 0.0))
+            # include active session time up to now for persistence
+            if info.get('is_present') and info.get('start'):
+                end_time = info.get('last_seen') or now
+                acc += (end_time - info['start']).total_seconds()
+            c.execute("INSERT OR REPLACE INTO current_state (name, camera_id, accumulated_seconds, last_update) VALUES (?, ?, ?, datetime('now'))", (name, camera_id, acc))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] save_current_state failed: {e}")
+
+
 def finalize_presence_for_exit(presence: dict, camera_id: str):
     """When exiting, finalize any active sessions and write to DB."""
     now = datetime.now()
@@ -331,6 +437,11 @@ def finalize_presence_for_exit(presence: dict, camera_id: str):
                 print(f"[WARN] Failed to log session for {name}: {e}")
             info['start'] = None
             info['is_present'] = False
+    # persist the current accumulated totals so restarts resume from here
+    try:
+        save_current_state(presence, camera_id)
+    except Exception as e:
+        print(f"[WARN] Could not save current_state on exit: {e}")
 
 
 def seconds_to_hms(secs: float):
@@ -360,7 +471,21 @@ def run_camera(camera_source, known_embeddings, threshold: float, sound_on_unkno
     print(f"[INFO] Starting camera: {camera_id}")
     # initialize presence tracking for known employees
     presence = init_presence(known_embeddings)
+    # load today's accumulated totals into presence
+    todays = load_today_totals()
+    for name, seconds in todays.items():
+        if name in presence:
+            presence[name]['accumulated'] = seconds
+    # load persistent current_state accumulators so restarts resume from same totals
+    current_state = load_current_state()
+    for name, seconds in current_state.items():
+        if name in presence:
+            # current_state is authoritative for accumulated seconds across restarts
+            presence[name]['accumulated'] = seconds
+    # track current day for midnight rollover
+    current_day = datetime.now().date()
 
+    last_autosave = time.time()
     while True:
         ret, frame = cam.read()
         if not ret:
@@ -448,6 +573,31 @@ def run_camera(camera_source, known_embeddings, threshold: float, sound_on_unkno
 
         # After processing faces, check for absences (timeout)
         now_check = datetime.now()
+
+        # handle midnight rollover: if date changed, finalize sessions up to midnight and reset daily accumulators
+        if now_check.date() != current_day:
+            # midnight timestamp (the boundary between current_day and now_check.date())
+            midnight = datetime(now_check.year, now_check.month, now_check.day)
+            print(f"[INFO] Midnight rollover detected. Finalizing sessions up to {midnight} and resetting daily totals.")
+            for name, info in presence.items():
+                if info['is_present'] and info['start'] is not None:
+                    # close previous day's portion
+                    prev_start = info['start']
+                    # end at midnight
+                    end_prev = midnight
+                    duration_prev = (end_prev - prev_start).total_seconds() if prev_start else 0.0
+                    if duration_prev > 0:
+                        try:
+                            log_session(name, prev_start, end_prev, duration_prev, camera_id)
+                        except Exception as e:
+                            print(f"[WARN] Failed to log midnight-split session for {name}: {e}")
+                    # reset accumulated to 0 for the new day
+                    info['accumulated'] = 0.0
+                    # start new session at midnight if still present
+                    info['start'] = midnight
+                    info['last_seen'] = midnight
+            # update current_day
+            current_day = now_check.date()
         for name, info in presence.items():
             if info['is_present']:
                 last = info['last_seen'] or now_check
@@ -517,12 +667,28 @@ def run_camera(camera_source, known_embeddings, threshold: float, sound_on_unkno
                 cv2.putText(display, msg, (10, y_alert), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
                 y_alert += 30
 
+        # periodic autosave
+        try:
+            if config.ENABLE_AUTOSAVE and (time.time() - last_autosave) >= config.AUTOSAVE_INTERVAL:
+                save_current_state(presence, camera_id)
+                print(f"[INFO] Autosaved current_state ({config.AUTOSAVE_INTERVAL}s)")
+                last_autosave = time.time()
+        except Exception as e:
+            print(f"[WARN] Autosave failed: {e}")
+
         if config.SHOW_WINDOW:
             cv2.imshow('Face Recognition', display)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 print("[INFO] Quitting by user request (q)")
                 break
+            elif key == ord('s'):
+                # admin manual save
+                try:
+                    save_current_state(presence, camera_id)
+                    print("[INFO] Current state saved (manual 's' command)")
+                except Exception as e:
+                    print(f"[WARN] Manual save failed: {e}")
 
     # finalize any active presence sessions on exit
     try:
@@ -548,11 +714,35 @@ def main():
     parser.add_argument('--threshold', required=False, type=float, default=config.THRESHOLD, help='Similarity threshold (0..1)')
     parser.add_argument('--sound', required=False, type=lambda x: x.lower() in ['true', '1', 'yes'], default=config.SOUND_ON_UNKNOWN, help='Play beep on unknown detections')
     parser.add_argument('--register', nargs=2, metavar=('NAME', 'IMAGE_PATH'), help='Register a new employee: NAME IMAGE_PATH')
+    parser.add_argument('--show-state', action='store_true', help='Print current persisted state (current_state table) and exit')
+    parser.add_argument('--export-state', metavar='CSV_PATH', help='Export current persisted state (current_state table) to CSV and exit')
 
     args = parser.parse_args()
 
     # Create DB if not exists
     create_db_if_needed()
+
+    # Quick CLI actions: show or export current_state and exit
+    if args.show_state or args.export_state:
+        state = load_current_state()
+        if args.show_state:
+            if not state:
+                print("No current_state data found.")
+            else:
+                print("Current persisted state:")
+                for n, s in state.items():
+                    print(f"{n}: {seconds_to_hms(s)} ({s:.1f} seconds)")
+        if args.export_state:
+            try:
+                with open(args.export_state, 'w', newline='', encoding='utf-8') as f:
+                    w = csv.writer(f)
+                    w.writerow(['name', 'accumulated_seconds', 'hh:mm:ss'])
+                    for n, s in state.items():
+                        w.writerow([n, f"{s:.1f}", seconds_to_hms(s)])
+                print(f"Exported current_state to {args.export_state}")
+            except Exception as e:
+                print(f"[ERROR] Failed to export to CSV: {e}")
+        return
 
     # Load known embeddings and display name map
     known_embeddings, display_names = load_employee_embeddings()
