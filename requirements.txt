@@ -1,0 +1,8 @@
+opencv-python
+deepface
+numpy
+imutils
+# sqlite3 is part of the Python standard library (no pip package required)
+# Use CPU-only TensorFlow to avoid GPU/CUDA usage
+tensorflow-cpu
+tf-keras

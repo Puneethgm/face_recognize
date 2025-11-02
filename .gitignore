@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# SQLite database
+database.db
+
+# DeepFace / model caches (if any)
+.deepface/
+deepface/weights/
+retinaface/*.h5
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-* 
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Python packaging
+dist/
+build/
+*.egg-info/
+
+# PyCharm
+*.iml
+
+# Ignore large employee folder artifacts? (Keep images tracked by default)
+# If you want to ignore employee images, uncomment the next line
+# employees/*
