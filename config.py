@@ -38,3 +38,7 @@ RECORD_SESSIONS = True
 # After this many seconds of continuous absence, raise an alert (beep + message)
 # Set to 60 for one minute
 ABSENCE_ALERT_SECONDS = 60
+
+# Autosave settings: periodically persist current_state to survive crashes
+ENABLE_AUTOSAVE = True
+AUTOSAVE_INTERVAL = 30  # seconds
